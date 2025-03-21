@@ -203,8 +203,6 @@ class SegFormer(nn.Module):
         self.num_classes = num_classes
         self.depths = depths
 
-        self.ssl = ssl
-
         self.initial_dims = initial_dims
         # self.initial_dims = 64
         self.initial_conv = nn.Conv3d(in_channels=in_channels, out_channels=self.initial_dims, stride=2, padding=1, kernel_size=3)
@@ -475,20 +473,6 @@ class SegFormerDecoderHead(nn.Module):
         x = self.relu(x)
         x = self.norm_quarter(x)
         x = self.dropout(x)
-        if self.ssl:
-            x_ssl = F.interpolate(x, scale_factor=2)
-            x_ssl = self.ssl_conv_smoother(x_ssl)
-            x_ssl = self.ssl_relu(x_ssl)
-            x_ssl = self.ssl_norm_half(x_ssl)
-            x_ssl = self.ssl_dropout(x_ssl)
-            # Block
-            x_ssl = F.interpolate(x_ssl, scale_factor=2)
-            # Now at original resolution
-            x_ssl = self.ssl_conv_fullsize_smoother(x_ssl)
-            x_ssl = self.ssl_relu(x_ssl)
-            x_ssl = self.ssl_norm_full(x_ssl)
-            # No dropout here
-            x_ssl = self.ssl_linear_pred(x_ssl)
         # print("After fusing/stacking all the segformer blocks together: ", x.shape)
         # Block, need conv + relu + norm
         x = F.interpolate(x, scale_factor=2)
@@ -507,7 +491,4 @@ class SegFormerDecoderHead(nn.Module):
         x = self.norm_full(x)
         # No dropout here
         x = self.linear_pred(x)
-        if self.ssl:
-            return x, x_ssl
-        else:
-            return x
+        return x
