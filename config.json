@@ -1,0 +1,23 @@
+{
+    "loss": "CrossEntropyLoss",
+    "optimizer": {
+        "name": "AdamW",
+        "params": {
+            "lr": 1e-4,
+            "weight_decay": 1e-3,
+            "amsgrad": true
+        }
+    },
+    "scheduler": {
+        "type": "StepLR",
+        "params": {
+            "step_size": 10,
+            "gamma": 0.85
+        }
+    },
+    "model": {
+        "name": "Segformer3d",
+        "zoom_size": 128,
+        "patch_size": 7
+    }
+}
