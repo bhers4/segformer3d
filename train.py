@@ -9,20 +9,30 @@ from scipy import ndimage
 import time
 import torch
 from torch.utils.data import DataLoader, Dataset
-from typing import Union
+import torchvision.transforms as transforms
 from torch.utils.tensorboard import SummaryWriter
+from typing import Union, List, Tuple
 # Custom imports
 from loss import DiceBCELoss
-from utils import generate_fake_data, find_files
+from utils import generate_fake_data, find_files, Random90Flip, RandomRotations, RandomBlur, RandomNoise, GammaDistortion
 from segformer3d import SegFormer
 
 class UltrasoundDataset(Dataset):
-    def __init__(self, volumes, labels):
+    def __init__(self, volumes, labels, augment: bool = True):
         self.volumes = volumes
         self.labels = labels
         self.shape_0_min = 210
         self.shape_1_min = 200
         self.shape_2_min = 160
+        self.augment = augment
+        # Initialize basic transforms
+        self.transforms = transforms.Compose([
+            Random90Flip(),
+            RandomRotations(min_degree=-10, max_degree=10),
+            RandomBlur(sigma=0.6),
+            RandomNoise(mean=0.08, std=0.05),
+            GammaDistortion(min_pow=1.0, max_pow=1.5)
+        ])
 
     def __len__(self):
         return len(self.volumes)
@@ -40,6 +50,8 @@ class UltrasoundDataset(Dataset):
         volume = UltrasoundDataset.zoom_img(volume, 128)
         label = UltrasoundDataset.zoom_img(label, 128)
         volume = (volume - volume.min()) / (volume.max() - volume.min())
+        if self.augment:
+            volume, label = self.run_augment(volume, label)
         return volume[0, :, :, :], label[0, :, :, :]
 
     @staticmethod
@@ -77,6 +89,39 @@ class UltrasoundDataset(Dataset):
         img = ndimage.zoom(img, zoom=(x_zoom, y_zoom, z_zoom))
         img = torch.tensor(img[None,:,:,:], dtype=torch.float)
         return img
+    
+    @staticmethod
+    def clean_label(label):
+        label = (label - label.min()) / (label.max() - label.min())
+        # Go through and adjust it
+        for i in range(label.shape[3]):
+            ul = label[0, :, :, i]
+            ul_diff = ul.max() - ul.min()
+            if ul_diff == 0:
+                ul = torch.zeros_like(ul)
+            else:
+                ul[ul < 0.3] = 0.0
+                ul[ul > 0.3] = 1.0
+            label[0,:,:,i] = ul
+        return label
+
+    def run_augment(self, img: torch.Tensor, label: torch.Tensor) -> Tuple[torch.Tensor]:
+        # Runs augmentations and packs/unpacks the tensors into a dictionary the transforms expect
+        if len(img.shape) == 4:
+            img = img[0, :, :, :]
+        if len(label.shape) == 4:
+            label = label[0, :, :, :]
+        data = {'img': img, 'label': label}
+        # Do transforms
+        data = self.transforms(data)
+        # Clean label
+        img = data['img']
+        label = self.clean_label(data['label'][None, :, :, :])
+        if len(label.shape) == 3:
+            label = label[None]
+        if len(img.shape) == 3:
+            img = img[None]
+        return img, label
 
 def calculate_dice_and_iou(pred: torch.Tensor, target: torch.Tensor) -> tuple:
     thresholded = pred.clone().detach()
@@ -94,7 +139,6 @@ def calculate_dice_and_iou(pred: torch.Tensor, target: torch.Tensor) -> tuple:
     #   0     where prediction is 0 and truth is 1 (False Negative)
     true_positives = torch.sum(confusion_vector == 1).item()
     false_positives = torch.sum(confusion_vector == float('inf')).item()
-    true_negatives = torch.sum(torch.isnan(confusion_vector)).item()
     false_negatives = torch.sum(confusion_vector == 0).item()
     if (2*true_positives + false_positives + false_negatives) == 0:
         dice = 0.0
@@ -115,6 +159,10 @@ def main(args):
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
     
+    # Create checkpoint directory
+    checkpoint_dir = os.path.join("checkpoints", datetime.now().strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
     if args.generate_fake_data:
         training_data, validation_data, testing_data = \
             generate_fake_data(num_samples=100, output_dir=input_dir)
@@ -125,9 +173,11 @@ def main(args):
     else:
         volumes, labels = find_files(directory=input_dir, extension=".npy")
         """
-            In Segformer3d paper, we split data by patient as there was multiple volumes per patient but in this demo we
-            show a simple training loop. For other medical imaging applications close attention should be paid to not
-            having data leakage between training, validation and test sets.
+            In Segformer3d paper, we split data by patient as there was multiple
+            volumes per patient but in this demo we show a simple training loop.
+            For other medical imaging applications close attention should be
+            paid to not having data leakage between training, validation and
+            test sets.
         """
         # Generate a train, validation, and test split
         training_data = volumes[:int(0.6*len(volumes))]
@@ -139,32 +189,58 @@ def main(args):
     
     # Create the datasets
     training_dataset = UltrasoundDataset(training_data, training_labels)
-    validation_dataset = UltrasoundDataset(validation_data, validation_labels)
-    testing_dataset = UltrasoundDataset(testing_data, testing_labels)
+    validation_dataset = UltrasoundDataset(validation_data, validation_labels, augment=False)
+    testing_dataset = UltrasoundDataset(testing_data, testing_labels, augment=False)
 
     # Create the dataloaders
-    training_dataloader = DataLoader(training_dataset, batch_size=1, shuffle=True)
-    validation_dataloader = DataLoader(validation_dataset, batch_size=1, shuffle=False)
-    testing_dataloader = DataLoader(testing_dataset, batch_size=1, shuffle=False)
+    training_dataloader = DataLoader(training_dataset, batch_size=1,
+                                     shuffle=True)
+    validation_dataloader = DataLoader(validation_dataset, batch_size=1,
+                                       shuffle=False)
+    testing_dataloader = DataLoader(testing_dataset, batch_size=1,
+                                     shuffle=False)
 
     # Create the model
-    model = SegFormer(zoom_size=config['model']['zoom_size'], patch_size=config['model']['patch_size'], num_classes=1)
+    model = SegFormer(zoom_size=config['model']['zoom_size'],
+                      patch_size=config['model']['patch_size'], num_classes=1)
     model.cuda()
 
     # Create the optimizer
     if config['optimizer']['name'] == 'Adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['optimizer']['params']['lr'],
-                                     weight_decay=config['optimizer']['params']['weight_decay'],
-                                     amsgrad=config['optimizer']['params']['amsgrad'])
+        optimizer = torch.optim.Adam(model.parameters(),
+                    lr=config['optimizer']['params']['lr'],
+                    weight_decay=config['optimizer']['params']['weight_decay'],
+                    amsgrad=config['optimizer']['params']['amsgrad'])
     elif config['optimizer']['name'] == 'AdamW':
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config['optimizer']['params']['lr'],
-                                      weight_decay=config['optimizer']['params']['weight_decay'],
-                                      amsgrad=config['optimizer']['params']['amsgrad'])
+        optimizer = torch.optim.AdamW(model.parameters(),
+                    lr=config['optimizer']['params']['lr'],
+                    weight_decay=config['optimizer']['params']['weight_decay'],
+                    amsgrad=config['optimizer']['params']['amsgrad'])
     else:
         raise ValueError("Optimizer not supported")
     # Create the learning rate scheduler
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config['scheduler']['params']['step_size'],
-                                                   gamma=config['scheduler']['params']['gamma'])
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
+                    step_size=config['scheduler']['params']['step_size'],
+                    gamma=config['scheduler']['params']['gamma'])
+    
+    # Initialize starting epoch and best validation loss
+    start_epoch = 0
+    best_val_loss = float('inf')
+    
+    # Load checkpoint if provided
+    if args.checkpoint:
+        if os.path.exists(args.checkpoint):
+            print(f"Loading checkpoint from {args.checkpoint}")
+            checkpoint = torch.load(args.checkpoint)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint['best_val_loss']
+            print(f"Resuming training from epoch {start_epoch}")
+        else:
+            print(f"Checkpoint file {args.checkpoint} not found. Starting from scratch.")
+    
     # Create loss function, default to BCEWithLogitsLoss
     if config['loss'] == 'DiceBCELoss':
         loss_fn = DiceBCELoss()
@@ -175,8 +251,8 @@ def main(args):
     # Log the json config to tensorboard so we can correlate the config used with each run.
     writer.add_text('Config', json.dumps(config, indent=4))
     # Set number of epochs
-    num_epochs = 10
-    for epoch in range(num_epochs):
+    num_epochs = config['epochs']
+    for epoch in range(start_epoch, num_epochs):
         # Start timing the epoch
         epoch_start_time = time.time()
         
@@ -252,12 +328,35 @@ def main(args):
         # Calculate and log average validation loss for the epoch
         avg_val_loss = val_loss / val_batches
         writer.add_scalar('Loss/validation_epoch', avg_val_loss, epoch)
+        
+        # Save checkpoint
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': lr_scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'config': config
+        }
+        
+        # Save latest checkpoint
+        checkpoint_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pth')
+        torch.save(checkpoint, checkpoint_path)
+        
+        # Save best checkpoint if validation loss improved
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            checkpoint['best_val_loss'] = best_val_loss
+            best_checkpoint_path = os.path.join(checkpoint_dir, 'best_checkpoint.pth')
+            torch.save(checkpoint, best_checkpoint_path)
+            print(f"New best validation loss: {best_val_loss:.4f} - saved best checkpoint")
+        
         # Calculate epoch duration
         epoch_duration = time.time() - epoch_start_time
         # Log epoch duration
         writer.add_scalar('Time/epoch_duration_seconds', epoch_duration, epoch)
         # Calculate time left in training
-        time_left = (num_epochs - epoch) * epoch_duration
+        time_left = (num_epochs - epoch - 1) * epoch_duration
         # Print epoch results including duration
         print(f"Epoch {epoch} - Avg Train Loss: {avg_train_loss:.4f}, Avg Validation Loss: {avg_val_loss:.4f}, Duration: {epoch_duration:.2f} seconds, Time left: {time_left:.2f} seconds")
     
@@ -270,6 +369,8 @@ if __name__ == "__main__":
     parser.add_argument("--input_dir", type=str, required=True)
     parser.add_argument("--config", type=str, required=True,
                         help="Path to the config file.")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to checkpoint file to resume training from.")
     parser.add_argument("--generate-fake-data", action="store_true",
                         help="Generate fake data for training/testing purposes.")
     parser.add_argument("--message", type=str, default="", 

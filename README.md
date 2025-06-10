@@ -5,7 +5,5 @@ This is the official code repository for the paper: [SegFormer3D: Improving the 
 Currently in progress of porting over a standalone training example of the Segformer3d model.
 
 ### TODO List
-- Add more augmentations
-- Log Dice and F1 to tensorboard
-- At very end call test set
+- Enable logging of checkpoints and loading of checkpoints
 - MLFlow integration?
